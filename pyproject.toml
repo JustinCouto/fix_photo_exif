@@ -1,0 +1,48 @@
+[project]
+name = "photofix"
+version = "0.1.0"
+description = "Audit and repair photo metadata in a large archive, via reviewable CSVs and exiftool"
+readme = "README.md"
+requires-python = ">=3.11"
+# Zero runtime dependencies. All metadata I/O goes through the exiftool
+# subprocess; explicitly not pyexiv2 or piexif, which mishandle HEIC and PNG.
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/photofix"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import from src/ without requiring an editable install, so the suite runs on a
+# bare checkout with nothing but pytest present.
+pythonpath = ["src", "."]
+markers = [
+    "exiftool: requires the exiftool binary on PATH",
+]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests", "scan.py", "apply.py", "verify.py"]
+# tools/ holds the fixture builder and the Phase 0 probe, which the integration
+# test imports directly rather than through the package.
+mypy_path = "src:tools"

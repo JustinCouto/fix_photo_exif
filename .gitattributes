@@ -1,0 +1,9 @@
+# Keep LF in the repo so files authored on Windows behave on the macOS target.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.db binary

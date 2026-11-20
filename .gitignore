@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Scan/apply/verify artifacts
+out/
+*.jsonl
+scan.db
+scan.db-wal
+scan.db-shm
+
+# exiftool backups must never be committed
+*_original

@@ -25,7 +25,24 @@ PNG = base64.b64decode(
 GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 WEBP = base64.b64decode("UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA/vuUAAA=")
 
-SEEDS = {".jpg": JPEG, ".png": PNG, ".gif": GIF, ".webp": WEBP, ".bmp": b"BM" + b"\x00" * 60}
+#: A 1x1 24-bit BMP: file header, BITMAPINFOHEADER, one padded pixel row.
+BMP = (
+    b"BM"
+    + (58).to_bytes(4, "little")
+    + b"\x00" * 4
+    + (54).to_bytes(4, "little")
+    + (40).to_bytes(4, "little")
+    + (1).to_bytes(4, "little")
+    + (1).to_bytes(4, "little")
+    + (1).to_bytes(2, "little")
+    + (24).to_bytes(2, "little")
+    + b"\x00" * 4
+    + (4).to_bytes(4, "little")
+    + b"\x00" * 16
+    + b"\xff\xff\xff\x00"
+)
+
+SEEDS = {".jpg": JPEG, ".png": PNG, ".gif": GIF, ".webp": WEBP, ".bmp": BMP}
 
 
 def make(root: Path) -> list[tuple[Path, str | None]]:
@@ -62,7 +79,7 @@ def make(root: Path) -> list[tuple[Path, str | None]]:
         add(f"Bulk Export 2/b{i:03d}.jpg", "2013:01:01 00:00:00")
 
     # Formats with partial or no write capability.
-    add("Mixed Formats/animation.gif")  # XMP only
+    add("Mixed Formats/animation_2019-07-04.gif")  # XMP only
     add("Mixed Formats/sticker.webp")  # no IPTC
     add("Mixed Formats/diagram.png")
     add("Mixed Formats/old.bmp")  # unwritable

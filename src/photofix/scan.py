@@ -16,17 +16,27 @@ from __future__ import annotations
 import argparse
 import shutil
 import time
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import EXIT_ATTENTION, EXIT_OK, EXIT_USAGE
-from .classify import CLUSTER_THRESHOLD, assess, build_folder_chain, format_exif
+from .classify import (
+    CLUSTER_THRESHOLD,
+    ClockSample,
+    assess,
+    build_folder_chain,
+    clock_shifts,
+    exact_folder_day,
+    format_exif,
+    parse_exif,
+)
 from .csvio import write_review_csv
-from .exiftool import ExifTool, ExifToolError
-from .folders import classify_folder
+from .exiftool import READ_VERSION, ExifTool, ExifToolError, normalize_key
+from .folders import classify_folder, derive_keywords, is_subfolder_title
 from .logging_setup import ProgressReporter, get_logger, setup_logging
 from .models import FileRecord, FolderProposal, FolderRecord, ScanError
-from .store import ScanStore
+from .store import ScanStore, normalize_timestamp
 from .walker import WalkStats, walk_images
 
 WALK_CHUNK = 2000
@@ -102,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return EXIT_USAGE
         store.set_meta("root", str(root))
+        stale = store.forget_stale_reads(READ_VERSION)
+        if stale:
+            log.info("re-reading files scanned by an older version", extra={"files": stale})
 
         stats = _stage_a(store, root, limit=args.limit, log=log)
         failures = _stage_b(store, tool, log=log)
@@ -132,14 +145,23 @@ def _stage_a(store: ScanStore, root: Path, *, limit: int | None, log: object) ->
     stats = WalkStats()
     batch = []
     total = 0
+    seen: set[str] = set()
     for walked in walk_images(root, limit=limit, stats=stats):
         batch.append(walked)
+        seen.add(normalize_key(walked.path))
         if len(batch) >= WALK_CHUNK:
             total += store.upsert_walked(batch)
             batch.clear()
     if batch:
         total += store.upsert_walked(batch)
     store.mark_walk_complete(limit is None)
+    # Only a complete walk proves a file is gone; --limit stops early by design.
+    # Unreadable directories would make their files look deleted, so skip then too.
+    if limit is None and not stats.unreadable and (pruned := store.prune(seen)):
+        logger.info("forgot files no longer in the archive", extra={"count": pruned})
+    retried = store.retry_unreadable()
+    if retried:
+        logger.info("retrying files that were unreadable last time", extra={"count": retried})
     logger.info("stage A complete", extra={"recorded": total, **stats.as_dict()})
     return stats
 
@@ -216,11 +238,17 @@ def _stage_c(
 
     now = datetime.now()
     file_rows: list[dict[str, object]] = []
+    samples: list[ClockSample] = []
     progress = ProgressReporter("classify", total=store.count(), interval_seconds=5.0)
 
     for stored in store.iter_files():
         chain = build_folder_chain(stored.folder, str(root), folder_cache)
         verdict = assess(stored, folder_chain=chain, clusters=clusters, now=now, xmp_enabled=xmp_enabled)
+        taken = parse_exif(normalize_timestamp(stored.datetime_original))
+        day = exact_folder_day(chain, now=now) if verdict.date_status == "ok" else None
+        if taken is not None and day is not None and verdict.writable:
+            camera = str(stored.meta.get("EXIF:Model") or stored.meta.get("EXIF:Make") or "")
+            samples.append(ClockSample(str(len(file_rows)), (stored.folder, camera), taken, day))
         file_rows.append(
             {
                 "SourceFile": stored.real_path,
@@ -237,8 +265,8 @@ def _stage_c(
                 # actually gets written comes from folder inheritance unless the
                 # reviewer types something here, and pre-filling them would make
                 # an inherited value indistinguishable from a chosen one.
-                "proposed_keywords": "",
-                "proposed_title": "",
+                "override_keywords": "",
+                "override_title": "",
                 "scan_size": stored.size,
                 "scan_mtime": f"{stored.mtime:.6f}",
                 "cluster_size": verdict.cluster_size,
@@ -249,28 +277,59 @@ def _stage_c(
                 "date_rule": verdict.date_rule,
                 "inherit_title": verdict.inherit_title,
                 "inherit_keywords": verdict.inherit_keywords,
+                "filename_title": verdict.filename_title,
+                "title_to_write": verdict.title_to_write,
+                "keywords_to_write": verdict.keywords_to_write,
                 "apply": 1 if verdict.apply else 0,
             }
         )
         progress.advance()
     progress.finish()
 
+    shifts = clock_shifts(samples)
+    by_key = {s.key: s for s in samples}
+    for key, days in shifts.items():
+        row = file_rows[int(key)]
+        flags = [f for f in str(row["date_flags"]).split(",") if f and f != "folder_disagrees"]
+        row.update(
+            proposed_date=format_exif(by_key[key].taken + timedelta(days=days)),
+            date_source="clock_shift",
+            date_rule="clock_shift",
+            date_match=f"{days:+d} days",
+            confidence="medium",
+            date_flags=",".join([*flags, "clock_shift"]),
+            # A folder name can be wrong too, so moving a whole event is the reviewer's call.
+            apply=0,
+        )
+    if shifts:
+        logger.info("camera clocks to correct", extra={"files": len(shifts)})
+
     folder_rows = [
         {
             "folder_path": path,
             "file_count": folder_counts.get(path, 0),
             "folder_name": Path(path).name,
-            "proposed_title": proposal.title,
-            "proposed_keywords": proposal.keywords,
-            "proposed_date": format_exif(proposal.date) if proposal.date else "",
+            "title": proposal.title,
+            "keywords": proposal.keywords,
+            "date_found": _date_found(proposal),
             "skip": 1 if proposal.skip else 0,
         }
         for path, proposal in sorted(folder_cache.items())
-        if path in folder_counts
+        # Ancestors holding no images directly are listed too: apply inherits
+        # only from folders.csv, and in "Christmas/2020/" the parent is the one
+        # with the title. Root is left out, matching build_folder_chain.
+        if path != str(root)
     ]
 
-    write_review_csv(out_dir / "files.csv", FileRecord.columns(), file_rows)
-    write_review_csv(out_dir / "folders.csv", FolderRecord.columns(), folder_rows)
+    for name, columns, rows in (
+        ("files.csv", FileRecord.columns(), file_rows),
+        ("folders.csv", FolderRecord.columns(), folder_rows),
+    ):
+        path = out_dir / name
+        _keep_review_edits(store, path)
+        write_review_csv(path, columns, rows)
+        store.set_meta(f"written:{name}", str(path.stat().st_mtime))
+    store.conn.commit()
     write_review_csv(
         out_dir / "scan_errors.csv",
         ScanError.columns(),
@@ -294,6 +353,34 @@ def _stage_c(
     }
 
 
+def _keep_review_edits(store: ScanStore, path: Path) -> None:
+    """Copy a review CSV aside if it was edited since this tool wrote it.
+
+    A rescan regenerates files.csv and folders.csv from scratch, and an apply
+    conflict tells the user to rescan, so without this an afternoon of review
+    edits would be silently replaced.
+    """
+    if not path.exists() or store.get_meta(f"written:{path.name}") == str(path.stat().st_mtime):
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.stem}.edited-{stamp}{path.suffix}")
+    shutil.copy2(path, backup)
+    get_logger().warning(
+        "kept your edited copy before regenerating it; copy decisions back from it if needed",
+        extra={"file": path.name, "backup": str(backup)},
+    )
+
+
+def _date_found(proposal: FolderProposal) -> str:
+    if proposal.date:
+        return format_exif(proposal.date)
+    if proposal.year_span:
+        return f"spans {proposal.year_span[0]}-{proposal.year_span[1]}: no date"
+    if proposal.partial:
+        return f"{proposal.partial.match} (year from a parent folder)"
+    return ""
+
+
 def _build_folder_cache(folder_counts: dict[str, int], root: Path) -> dict[str, FolderProposal]:
     """Classify every folder holding images, plus all their ancestors.
 
@@ -311,6 +398,21 @@ def _build_folder_cache(folder_counts: dict[str, int], root: Path) -> dict[str, 
             if current == root or current.parent == current or root not in current.parents:
                 break
             current = current.parent
+
+    # "Disney 2018/Day 1" titles its photos "Disney Day 1", not "Day 1".
+    # Parents first, so "Trip/Day 1/Part 2" builds on an already-prefixed parent.
+    for key in sorted(cache, key=lambda k: len(Path(k).parts)):
+        proposal = cache[key]
+        if proposal.skip or not is_subfolder_title(proposal.title):
+            continue
+        parent = Path(key).parent
+        while parent != root and root in parent.parents:
+            above = cache.get(str(parent))
+            if above is not None and above.has_text and above.title:
+                title = f"{above.title} {proposal.title}"
+                cache[key] = replace(proposal, title=title, keywords=derive_keywords(title))
+                break
+            parent = parent.parent
     return cache
 
 
@@ -326,7 +428,9 @@ def _print_summary(out_dir: Path, stats: WalkStats, counts: dict[str, int], *, f
     print(f"  unreadable files    {failures_count:>10,}")
     print(line)
     print(f"  Review {out_dir / 'files.csv'} and {out_dir / 'folders.csv'},")
-    print("  set the `apply` column, then run apply.py. Nothing has been written yet.")
+    print("  set the `apply` column, then try it with:")
+    print(f"    just apply {out_dir} --dry-run")
+    print("  Nothing has been written yet.")
     print(line)
 
 

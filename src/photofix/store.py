@@ -14,6 +14,7 @@ cannot index into a JSON blob.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator
@@ -21,8 +22,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .exiftool import normalize_key
+from .exiftool import READ_VERSION_TAG, normalize_key
+from .folders import is_placeholder_title
 from .walker import WalkedFile
+
+#: Where an existing capture date can live, in the order Apple Photos prefers.
+#: XMP:DateCreated is photoshop:DateCreated, which this tool also writes.
+DATE_TAGS: tuple[str, ...] = (
+    "EXIF:DateTimeOriginal",
+    "XMP:DateTimeOriginal",
+    "XMP:DateCreated",
+    "IPTC:DateCreated",
+)
+#: The two fields apply writes, XMP first because IPTC caps titles at 64 bytes,
+#: then the Windows Explorer title, which counts as a title the photo already has.
+TITLE_TAGS: tuple[str, ...] = ("XMP:Title", "IPTC:ObjectName", "EXIF:XPTitle")
+#: Where existing keywords can live. Any of them means "this photo has keywords".
+KEYWORD_TAGS: tuple[str, ...] = (
+    "IPTC:Keywords",
+    "XMP:Subject",
+    "XMP:TagsList",
+    "XMP:HierarchicalSubject",
+    "EXIF:XPKeywords",
+)
 
 SCHEMA_VERSION = 1
 
@@ -41,6 +63,7 @@ CREATE TABLE IF NOT EXISTS files (
     size        INTEGER NOT NULL,
     mtime       REAL NOT NULL,
     birthtime   REAL,
+    inode       INTEGER,
     -- NULL until stage B has read this file. Also the resume marker.
     meta_json   TEXT,
     scanned_at  REAL,
@@ -53,6 +76,14 @@ CREATE TABLE IF NOT EXISTS files (
     mime_type               TEXT,
     warning                 TEXT,
     error                   TEXT
+);
+
+-- Each file's metadata as it was just before apply last wrote it. Written by
+-- apply only, so verify can still tell intended changes from unintended ones
+-- after a rescan has replaced files.meta_json with post-apply values.
+CREATE TABLE IF NOT EXISTS baselines (
+    path       TEXT PRIMARY KEY,
+    meta_json  TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_dto_norm ON files(datetime_original_norm);
@@ -79,6 +110,18 @@ class StoredFile:
     mime_type: str | None
     warning: str | None
     error: str | None
+    inode: int | None = None
+
+    @property
+    def other_dates(self) -> list[tuple[str, str]]:
+        """Dates in the other DATE_TAGS, for when `datetime_original` is bad."""
+        first = normalize_timestamp(self.datetime_original)
+        out = []
+        for tag in DATE_TAGS:
+            value = _as_text(self.meta.get(tag))
+            if value and normalize_timestamp(value) != first:
+                out.append((tag, value))
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +144,15 @@ def normalize_timestamp(value: str | None) -> str | None:
     text = str(value).strip()
     if not text or text.startswith("0000"):
         return None
+    if _DATE_ONLY.match(text):
+        # IPTC and XMP dates are often a day with no time. That is a real date,
+        # not damage, and it groups with what the tool writes for a known day.
+        return f"{text[:10]} 12:00:00"
     head = text[:19]
     return head if len(head) == 19 else text
+
+
+_DATE_ONLY = re.compile(r"^\d{4}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z)?$")
 
 
 def _first(meta: dict[str, Any], *candidates: str) -> Any:
@@ -116,6 +166,13 @@ def _first(meta: dict[str, Any], *candidates: str) -> Any:
         if key in meta and meta[key] not in (None, "", []):
             return meta[key]
     return None
+
+
+def _title(meta: dict[str, Any]) -> str | None:
+    """The first real title, so an "Untitled" in one field cannot hide a real
+    title in the other. All placeholders gives the first, for display."""
+    present = [str(meta[k]) for k in TITLE_TAGS if meta.get(k) not in (None, "", [])]
+    return next((t for t in present if not is_placeholder_title(t)), present[0] if present else None)
 
 
 def _as_text(value: Any) -> str | None:
@@ -139,6 +196,11 @@ class ScanStore:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(files)")}
+        if "inode" not in columns:
+            # A scan.db from before inodes were recorded. Its NULLs differ from
+            # every walked inode, so each file is re-read once.
+            self.conn.execute("ALTER TABLE files ADD COLUMN inode INTEGER")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
         self.conn.commit()
 
@@ -183,8 +245,27 @@ class ScanStore:
         leave a previously-scanned file that has since been edited carrying its
         old `meta_json` forever, and every downstream phase would then be
         reasoning about a file that no longer exists in that form. Any change to
-        size or mtime resets the cache so stage B re-reads it.
+        size, mtime, or inode resets the cache so stage B re-reads it.
         """
+        changed = (
+            "files.size <> excluded.size OR files.mtime <> excluded.mtime"
+            " OR files.inode IS NOT excluded.inode"
+        )
+        reset = ",\n".join(
+            f"{column} = CASE WHEN {changed} THEN NULL ELSE files.{column} END"
+            for column in (
+                "meta_json",
+                "scanned_at",
+                "datetime_original",
+                "datetime_original_norm",
+                "create_date",
+                "keywords",
+                "title",
+                "mime_type",
+                "warning",
+                "error",
+            )
+        )
         rows = [
             (
                 normalize_key(f.path),
@@ -195,50 +276,23 @@ class ScanStore:
                 f.size,
                 f.mtime,
                 f.birthtime,
+                f.inode,
             )
             for f in files
         ]
         if not rows:
             return 0
         self.conn.executemany(
-            """
-            INSERT INTO files (path, real_path, folder, filename, ext, size, mtime, birthtime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO files (path, real_path, folder, filename, ext, size, mtime, birthtime, inode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
+                {reset},
                 real_path = excluded.real_path,
                 size      = excluded.size,
                 mtime     = excluded.mtime,
                 birthtime = excluded.birthtime,
-                meta_json = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.meta_json END,
-                scanned_at = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.scanned_at END,
-                datetime_original = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.datetime_original END,
-                datetime_original_norm = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.datetime_original_norm END,
-                create_date = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.create_date END,
-                keywords = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.keywords END,
-                title = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.title END,
-                mime_type = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.mime_type END,
-                warning = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.warning END,
-                error = CASE
-                    WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime
-                    THEN NULL ELSE files.error END
+                inode     = excluded.inode
             """,
             rows,
         )
@@ -258,7 +312,7 @@ class ScanStore:
         now = time.time()
         rows = []
         for key, meta in records.items():
-            dto = _as_text(_first(meta, "EXIF:DateTimeOriginal", "XMP:DateTimeOriginal"))
+            dto = _as_text(_first(meta, *DATE_TAGS))
             rows.append(
                 (
                     json.dumps(meta, ensure_ascii=False, default=str),
@@ -266,16 +320,8 @@ class ScanStore:
                     dto,
                     normalize_timestamp(dto),
                     _as_text(_first(meta, "EXIF:CreateDate", "XMP:CreateDate", "QuickTime:CreateDate")),
-                    _as_text(_first(meta, "IPTC:Keywords", "XMP:Subject", "XMP:TagsList")),
-                    _as_text(
-                        _first(
-                            meta,
-                            "IPTC:ObjectName",
-                            "XMP:Title",
-                            "EXIF:ImageDescription",
-                            "IPTC:Headline",
-                        )
-                    ),
+                    _as_text(_first(meta, *KEYWORD_TAGS)),
+                    _title(meta),
                     _as_text(_first(meta, "File:MIMEType")),
                     _as_text(_first(meta, "ExifTool:Warning")),
                     _as_text(_first(meta, "ExifTool:Error")),
@@ -296,6 +342,34 @@ class ScanStore:
         )
         self.conn.commit()
 
+    def retry_unreadable(self) -> int:
+        """Send files parked as unreadable back to stage B.
+
+        A file that could not be opened last time (permissions, a drive that
+        dropped off) may be readable now, and changing its permissions does not
+        change its size, mtime, or inode, so nothing else would re-read it.
+        """
+        cursor = self.conn.execute(
+            "UPDATE files SET meta_json = NULL, scanned_at = NULL, error = NULL "
+            "WHERE error IS NOT NULL AND meta_json = '{}'"
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def prune(self, keep: set[str]) -> int:
+        """Forget files a complete walk no longer found: deleted, moved, or renamed.
+
+        Left in place they would reappear in files.csv, and approving one would
+        make apply refuse the whole run because the file cannot be found.
+        """
+        rows = self.conn.execute("SELECT path FROM files")
+        gone = [str(row["path"]) for row in rows if row["path"] not in keep]
+        for start in range(0, len(gone), 900):
+            chunk = gone[start : start + 900]
+            self.conn.execute(f"DELETE FROM files WHERE path IN ({','.join('?' * len(chunk))})", chunk)
+        self.conn.commit()
+        return len(gone)
+
     def mark_unreadable(self, paths: Iterable[str], reason: str) -> None:
         """Park files exiftool could not read so resume does not retry forever."""
         rows = [(json.dumps({}), time.time(), reason, normalize_key(p)) for p in paths]
@@ -306,6 +380,16 @@ class ScanStore:
             rows,
         )
         self.conn.commit()
+
+    def forget_stale_reads(self, version: str) -> int:
+        """Queue for re-reading every file read with a different tag list."""
+        cursor = self.conn.execute(
+            "UPDATE files SET meta_json=NULL WHERE meta_json IS NOT NULL "
+            "AND json_extract(meta_json, ?) IS NOT ?",
+            (f'$."{READ_VERSION_TAG}"', version),
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     # -- queries ----------------------------------------------------------
 
@@ -359,6 +443,32 @@ class ScanStore:
                 out[str(row["path"])] = self._to_stored(row)
         return out
 
+    def save_baselines(self, files: Iterable[StoredFile]) -> None:
+        """Record what apply is about to change, replacing an earlier apply's record."""
+        rows = [(f.path, json.dumps(f.meta, ensure_ascii=False, default=str)) for f in files]
+        self.conn.executemany(
+            "INSERT INTO baselines(path, meta_json) VALUES(?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET meta_json=excluded.meta_json",
+            rows,
+        )
+        self.conn.commit()
+
+    def baselines(self, paths: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Pre-apply metadata, falling back to the scan's for files apply never recorded."""
+        keys = [normalize_key(p) for p in paths]
+        out = {key: stored.meta for key, stored in self.get_many(keys).items()}
+        for start in range(0, len(keys), 900):
+            chunk = keys[start : start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            for row in self.conn.execute(
+                f"SELECT path, meta_json FROM baselines WHERE path IN ({placeholders})", chunk
+            ):
+                try:
+                    out[str(row["path"])] = json.loads(row["meta_json"])
+                except json.JSONDecodeError:
+                    continue
+        return out
+
     @staticmethod
     def _to_stored(row: sqlite3.Row) -> StoredFile:
         raw = row["meta_json"]
@@ -383,4 +493,5 @@ class ScanStore:
             mime_type=row["mime_type"],
             warning=row["warning"],
             error=row["error"],
+            inode=int(row["inode"]) if row["inode"] is not None else None,
         )

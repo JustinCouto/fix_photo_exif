@@ -40,6 +40,8 @@ EXEMPT_MODULES: frozenset[str] = frozenset(
     {
         # Deletes scan.db under --fresh. Its own artifact, never the archive.
         "scan.py",
+        # Renames its own applied.csv.partial over applied.csv, never the archive.
+        "csvio.py",
     }
 )
 
@@ -106,18 +108,30 @@ def test_no_forbidden_exiftool_flags(path: Path) -> None:
             raise AssertionError(f"{path.name}: {flag} appears in live code — {why}\n  {stripped}")
 
 
-def test_apply_never_passes_dash_f() -> None:
-    """With -csv=, -f turns every empty cell into a deletion.
+def test_dash_f_only_travels_with_the_delete_marker(tmp_path: Path) -> None:
+    """With -csv=, -f makes a cell of "-" a deletion, and with an empty
+    MissingTagValue every blank cell. Empty means "leave this alone" across the
+    whole design, so -f is safe only with MissingTagValue set to the marker."""
+    import subprocess
 
-    Empty means "leave this alone" across the entire design, so -f would make
-    each approved row destroy the metadata it did not mention.
-    """
-    text = (SRC / "exiftool.py").read_text(encoding="utf-8")
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(("#", '"', "'")) or "assert" in stripped:
-            continue
-        assert '"-f"' not in stripped and "'-f'" not in stripped, f"found -f in: {stripped}"
+    from photofix.exiftool import DELETE_MARKER, ExifTool
+
+    seen: list[list[str]] = []
+
+    class Capturing(ExifTool):
+        def __init__(self) -> None:
+            self.work_dir = tmp_path
+            self.timeout = 1.0
+
+        def _run(self, args: object, *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+            seen.append(list(args))  # type: ignore[call-overload]
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    Capturing().apply_csv(tmp_path / "applied.csv", ["a.jpg"])
+    args = seen[0]
+    assert DELETE_MARKER and DELETE_MARKER.strip() not in ("", "-")
+    assert args.count("-f") == 1
+    assert args[args.index("-f") + 1 : args.index("-f") + 3] == ["-api", f"MissingTagValue={DELETE_MARKER}"]
 
 
 def test_the_only_module_invoking_exiftool_is_exiftool_py() -> None:

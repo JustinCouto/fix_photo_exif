@@ -19,12 +19,24 @@ from .formats import FileKind, classify_extension, normalize_suffix
 from .logging_setup import ProgressReporter, get_logger
 
 #: Directory names excluded wholesale, matched case-insensitively.
-EXCLUDED_DIR_NAMES: Final[frozenset[str]] = frozenset({"__macosx", "$recycle.bin", ".trash", ".trashes"})
+EXCLUDED_DIR_NAMES: Final[frozenset[str]] = frozenset(
+    {"__macosx", "$recycle.bin", ".trash", ".trashes", "system volume information"}
+    # Synology and QNAP thumbnail caches and recycle bins.
+    | {"@eadir", "#recycle", "#snapshot", "@recycle", ".@__thumb"}
+)
 
 #: Directory suffixes excluded wholesale. A .photoslibrary is an existing Apple
 #: Photos database; rewriting the originals inside it would corrupt a live
 #: library, and its contents are re-imported from Photos rather than from disk.
-EXCLUDED_DIR_SUFFIXES: Final[tuple[str, ...]] = (".photoslibrary", ".aplibrary", ".migratedphotolibrary")
+#: The same goes for iPhoto and Aperture libraries, and Lightroom's .lrdata
+#: folders hold its preview renders, not photos.
+EXCLUDED_DIR_SUFFIXES: Final[tuple[str, ...]] = (
+    ".photoslibrary",
+    ".photolibrary",
+    ".aplibrary",
+    ".migratedphotolibrary",
+    ".lrdata",
+)
 
 #: Exact filenames excluded, matched case-insensitively.
 EXCLUDED_FILENAMES: Final[frozenset[str]] = frozenset({"thumbs.db", "desktop.ini", ".ds_store", "picasa.ini"})
@@ -43,6 +55,7 @@ class WalkStats:
     hidden_skipped: int = 0
     originals_skipped: int = 0
     excluded_dirs: int = 0
+    symlinks_skipped: int = 0
     unreadable: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, int]:
@@ -53,6 +66,7 @@ class WalkStats:
             "hidden_skipped": self.hidden_skipped,
             "originals_skipped": self.originals_skipped,
             "excluded_dirs": self.excluded_dirs,
+            "symlinks_skipped": self.symlinks_skipped,
             "unreadable_dirs": len(self.unreadable),
         }
 
@@ -63,6 +77,9 @@ class WalkedFile:
     size: int
     mtime: float
     birthtime: float | None
+    #: exiftool replaces a file on write, so a new inode catches a rewrite that
+    #: kept both size and mtime (apply passes -P).
+    inode: int = 0
 
     @property
     def folder(self) -> str:
@@ -149,6 +166,11 @@ def walk_images(
                 continue
 
             path = Path(dirpath) / name
+            if path.is_symlink():
+                # exiftool writes a new file in the link's place, which would
+                # turn the link into a full copy and leave the target untouched.
+                stats.symlinks_skipped += 1
+                continue
             try:
                 st = path.stat()
             except OSError as exc:
@@ -160,7 +182,9 @@ def walk_images(
             yielded += 1
             if progress:
                 progress.advance(context=dirpath)
-            yield WalkedFile(path=path, size=st.st_size, mtime=st.st_mtime, birthtime=_birthtime(st))
+            yield WalkedFile(
+                path=path, size=st.st_size, mtime=st.st_mtime, birthtime=_birthtime(st), inode=st.st_ino
+            )
 
             if limit is not None and yielded >= limit:
                 if progress:

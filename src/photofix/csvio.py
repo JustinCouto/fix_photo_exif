@@ -19,6 +19,7 @@ design; quoting everything keeps the round trip intact either way.
 from __future__ import annotations
 
 import csv
+import os
 import sys
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
@@ -58,12 +59,16 @@ def write_exiftool_csv(path: Path, columns: Sequence[str], rows: Iterable[dict[s
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with path.open("w", encoding=EXIFTOOL_ENCODING, newline="") as fh:
+    # Written beside and renamed over: applied.csv accumulates every run, and a
+    # full disk or Ctrl-C halfway through a rewrite would lose earlier records.
+    partial = path.with_name(path.name + ".partial")
+    with partial.open("w", encoding=EXIFTOOL_ENCODING, newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(columns), lineterminator="\n")
         writer.writeheader()
         for row in rows:
             writer.writerow({c: _cell(row.get(c, "")) for c in columns})
             count += 1
+    os.replace(partial, path)
     return count
 
 
@@ -74,17 +79,30 @@ def read_review_csv(path: Path) -> Iterator[dict[str, str]]:
     re-saved by Excel, LibreOffice, or Numbers all read the same. Header
     whitespace is stripped because some editors pad columns on save.
     """
-    with path.open("r", encoding=REVIEW_ENCODING, newline="") as fh:
-        reader = csv.DictReader(fh)
-        if reader.fieldnames is None:
-            return
-        cleaned = [(name or "").strip() for name in reader.fieldnames]
-        for raw in reader:
-            row = {
-                key: ("" if value is None else str(value))
-                for key, value in zip(cleaned, (raw.get(orig) for orig in reader.fieldnames), strict=False)
-            }
-            yield row
+    try:
+        with path.open("r", encoding=REVIEW_ENCODING, newline="") as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames is None:
+                return
+            cleaned = [(name or "").strip() for name in reader.fieldnames]
+            for raw in reader:
+                row = {
+                    key: ("" if value is None else str(value))
+                    for key, value in zip(
+                        cleaned, (raw.get(orig) for orig in reader.fieldnames), strict=False
+                    )
+                }
+                yield row
+    except UnicodeDecodeError as exc:
+        raise CsvEncodingError(
+            f"{path.name} is not saved as UTF-8, so accented folder and file names would be "
+            "wrong. In Excel use File > Save As > 'CSV UTF-8 (Comma delimited)'; in Numbers, "
+            "Export To > CSV with Unicode (UTF-8) encoding."
+        ) from exc
+
+
+class CsvEncodingError(ValueError):
+    """A review CSV was re-saved in a legacy encoding."""
 
 
 def read_csv_headers(path: Path) -> list[str]:

@@ -27,20 +27,30 @@ from typing import Any
 
 from . import EXIT_ATTENTION, EXIT_OK, EXIT_USAGE
 from .csvio import read_review_csv, write_review_csv
-from .exiftool import ExifTool, ExifToolError, normalize_key
+from .exiftool import DELETE_MARKER, ExifTool, ExifToolError, normalize_key
 from .logging_setup import setup_logging
 from .models import VerifyResult
 from .store import ScanStore, normalize_timestamp
 from .walker import ORIGINAL_SUFFIX
 
-DATE_TAGS = ("EXIF:DateTimeOriginal", "EXIF:CreateDate", "XMP:DateCreated")
+DATE_TAGS = (
+    "EXIF:DateTimeOriginal",
+    "EXIF:CreateDate",
+    "XMP:DateCreated",
+    "XMP:DateTimeOriginal",
+    "XMP:CreateDate",
+    "IPTC:DateCreated",
+)
 TITLE_TAGS = ("IPTC:ObjectName", "XMP:Title")
 KEYWORD_TAGS = ("IPTC:Keywords", "XMP:Subject")
 
 
 def normalize_value(tag: str, value: Any) -> str:
-    """Reduce a tag value to something comparable across a write/read round trip."""
-    if value is None:
+    """Reduce a tag value to something comparable across a write/read round trip.
+
+    The delete marker means "absent", which reads back as nothing.
+    """
+    if value is None or value == DELETE_MARKER:
         return ""
     if tag in DATE_TAGS:
         return normalize_timestamp(str(value)) or ""
@@ -104,6 +114,8 @@ def compare(
             )
             continue
 
+        # Exact, keywords included: under --merge-keywords applied.csv already
+        # holds the full union, so anything more or less is not what was asked.
         for tag, intended in wanted.items():
             got = normalize_value(tag, current.get(tag))
             want = normalize_value(tag, intended)
@@ -207,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     db_path: Path = args.scan_db or (out_dir / "scan.db")
     if db_path.exists():
         with ScanStore(db_path) as store:
-            baseline = {s.path: s.meta for s in store.iter_files() if s.path in intent}
+            baseline = store.baselines(intent)
         log.info("baseline loaded from scan.db", extra={"files": len(baseline)})
     else:
         log.warning(
@@ -285,7 +297,8 @@ def _print_summary(out_dir: Path, report: Report) -> None:
     if report.failures:
         print(f"  Failures listed in {out_dir / 'verify_report.csv'}.")
     else:
-        print("  Everything applied.csv asked for is present, and nothing else changed.")
+        print("  Everything applied.csv asked for is present, and no other date, title, or")
+        print("  keyword tag changed. (Other metadata is not compared.)")
     if report.strays:
         print("  _original backups are your undo path; delete them only once you are satisfied.")
     print(line)

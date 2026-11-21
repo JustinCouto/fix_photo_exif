@@ -7,6 +7,7 @@ rather than quietly reducing the suite to unit tests.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -61,6 +62,12 @@ def test_scan_produces_reviewable_csvs(archive: Path, tmp_path_factory: pytest.T
     files = rows(out / "files.csv")
     assert files, "scan found no images"
     assert list(files[0]) == FileRecord.columns()
+
+    # Parents holding no images directly must still reach apply, or nothing
+    # inherits from "Christmas" in Christmas/2020/. The root is never listed.
+    folder_names = {r["folder_name"] for r in rows(out / "folders.csv")}
+    assert "DCIM" in folder_names
+    assert archive.name not in folder_names
 
     names = {Path(r["SourceFile"]).name for r in files}
     assert "IMG_0001.jpg" in names
@@ -186,7 +193,8 @@ def test_dry_run_writes_applied_csv_but_touches_no_image(scanned: tuple[Path, Pa
         ]
     )
     assert code == EXIT_OK
-    assert (out / "applied.csv").exists()
+    assert (out / "applied.dryrun.csv").exists()
+    assert not (out / "applied.csv").exists(), "applied.csv records real writes only"
     assert target.read_bytes() == before, "--dry-run must not modify an image"
     assert not (target.parent / "IMG_0001.jpg_original").exists()
 
@@ -198,7 +206,7 @@ def test_applied_csv_has_no_bom(scanned: tuple[Path, Path]) -> None:
     apply_main(
         ["--files-csv", str(out / "files.csv"), "--folders-csv", str(out / "folders.csv"), "--dry-run"]
     )
-    assert not (out / "applied.csv").read_bytes().startswith(b"\xef\xbb\xbf")
+    assert not (out / "applied.dryrun.csv").read_bytes().startswith(b"\xef\xbb\xbf")
 
 
 @requires_exiftool
@@ -334,36 +342,151 @@ def test_verify_catches_a_change_nobody_asked_for(scanned: tuple[Path, Path]) ->
     approve(out, {"IMG_0001.jpg"})
     apply_main(["--files-csv", str(out / "files.csv"), "--folders-csv", str(out / "folders.csv")])
 
-    # Stand in for an unintended write by changing a tag nobody requested.
+    # Stand in for an unintended write by changing a tag nobody requested, then
+    # rescan: the pre-apply baseline must outlive the rescan to notice.
     import subprocess
 
     target = work / "Hawaii Trip 2019" / "IMG_0001.jpg"
     subprocess.run(
-        [EXIFTOOL or "exiftool", "-EXIF:Make=Tampered", "-overwrite_original", "-q", str(target)],
-        check=False,
+        [
+            EXIFTOOL or "exiftool",
+            "-XMP-exif:DateTimeOriginal=1999:01:01 00:00:00",
+            "-overwrite_original",
+            "-q",
+            str(target),
+        ],
+        check=True,
         capture_output=True,
     )
-
-    # Make the baseline aware of the pre-tamper state by rescanning is wrong
-    # here; instead confirm the intended values still verify.
+    scan_main(["--root", str(work), "--out-dir", str(out)])
     code = verify_main(["--applied-csv", str(out / "applied.csv"), "--root", str(work)])
-    assert code in (EXIT_OK, EXIT_ATTENTION)
+    assert code == EXIT_ATTENTION
+    unexpected = [r for r in rows(out / "verify_report.csv") if r["bucket"] == "unexpected_change"]
+    assert [r["tag"] for r in unexpected] == ["XMP:DateTimeOriginal"]
 
 
 @requires_exiftool
 def test_a_gif_gets_its_date_via_xmp(scanned: tuple[Path, Path]) -> None:
     """GIF rejects EXIF and IPTC, so XMP is the only place its date can live."""
     work, out = scanned
-    approve(out, {"animation.gif"})
+    approve(out, {"animation_2019-07-04.gif"})
     code = apply_main(["--files-csv", str(out / "files.csv"), "--folders-csv", str(out / "folders.csv")])
     assert code == EXIT_OK
 
     from photofix.exiftool import ExifTool, normalize_key
 
-    target = work / "Mixed Formats" / "animation.gif"
+    target = work / "Mixed Formats" / "animation_2019-07-04.gif"
     result = ExifTool(work_dir=out).read_many([target])
     meta = result.records[normalize_key(target)]
     assert meta.get("XMP:DateCreated"), "the GIF date must land in XMP"
+
+
+def _photo(path: Path, *tags: str) -> Path:
+    import subprocess
+
+    from make_fixture import JPEG
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(JPEG)
+    if tags:
+        subprocess.run([EXIFTOOL or "exiftool", "-q", "-overwrite_original", *tags, str(path)], check=True)
+    return path
+
+
+@requires_exiftool
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod 000 does not block reads on Windows")
+def test_a_file_exiftool_cannot_open_is_reported_and_never_approved(tmp_path: Path) -> None:
+    """Read as empty, it would look dateless and its real date would be replaced."""
+    photo = _photo(tmp_path / "arc" / "Picnic 2012" / "IMG_1.jpg", "-DateTimeOriginal=2012:05:05 14:30:00")
+    out = tmp_path / "out"
+    photo.chmod(0)
+    try:
+        assert scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)]) == EXIT_ATTENTION
+        assert [Path(r["SourceFile"]).name for r in rows(out / "scan_errors.csv")] == ["IMG_1.jpg"]
+        row = by_name(rows(out / "files.csv"), "IMG_1.jpg")
+        assert row["apply"] == "0" and row["proposed_date"] == ""
+    finally:
+        photo.chmod(0o644)
+
+    # Readable again: the next scan re-reads it rather than trusting the failure.
+    assert scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)]) == EXIT_OK
+    row = by_name(rows(out / "files.csv"), "IMG_1.jpg")
+    assert row["date_status"] == "ok" and row["existing_date"] == "2012:05:05 14:30:00"
+
+
+@requires_exiftool
+def test_a_date_only_write_leaves_legacy_accented_iptc_readable(tmp_path: Path) -> None:
+    """A global CodedCharacterSet=UTF8 relabeled Latin-1 "Café" and it read back "Caf?"."""
+    import subprocess
+
+    photo = _photo(
+        tmp_path / "arc" / "Picnic 2012" / "IMG_1.jpg",
+        "-charset",
+        "iptc=latin",
+        "-IPTC:Caption-Abstract=Café",
+    )
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    approve(out, {"IMG_1.jpg"})
+    code = apply_main(["--files-csv", str(out / "files.csv"), "--folders-csv", str(out / "folders.csv")])
+    assert code == EXIT_OK
+    caption = subprocess.run(
+        [EXIFTOOL or "exiftool", "-s3", "-IPTC:Caption-Abstract", str(photo)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+    assert caption == "Café"
+    assert verify_main(["--applied-csv", str(out / "applied.csv")]) == EXIT_OK
+
+
+@requires_exiftool
+def test_a_rescan_keeps_a_copy_of_an_edited_files_csv(tmp_path: Path) -> None:
+    _photo(tmp_path / "arc" / "Picnic 2012" / "IMG_1.jpg")
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    assert not list(out.glob("files.edited-*.csv")), "an untouched files.csv needs no copy"
+
+    approve(out, set())
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    kept = list(out.glob("files.edited-*.csv"))
+    assert len(kept) == 1
+    assert by_name(rows(kept[0]), "IMG_1.jpg")["apply"] == "0"
+
+
+@requires_exiftool
+@pytest.mark.skipif(sys.platform == "win32", reason="newlines are not legal in Windows filenames")
+def test_a_newline_in_a_filename_cannot_inject_an_exiftool_option(tmp_path: Path) -> None:
+    """Scan only reads. A name like "x\\n-Title=PWNED.jpg" once wrote titles to its batch."""
+    import subprocess
+
+    arc = tmp_path / "arc" / "Trip"
+    victim = _photo(arc / "victim.jpg")
+    _photo(arc / "x\n-Title=PWNED.jpg")
+    before = victim.read_bytes()
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(tmp_path / "out")])
+    assert victim.read_bytes() == before
+    assert not list(arc.glob("*_original"))
+    title = subprocess.run(
+        [EXIFTOOL or "exiftool", "-s3", "-XMP:Title", str(victim)], capture_output=True, text=True
+    ).stdout
+    assert "PWNED" not in title
+
+
+@requires_exiftool
+def test_numeric_looking_text_round_trips_through_apply_and_verify(tmp_path: Path) -> None:
+    """exiftool's JSON gives 1.50 as a number; read back as 1.5 it never matched."""
+    _photo(tmp_path / "arc" / "Trip" / "IMG_1.jpg")
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    csv_rows = rows(out / "files.csv")
+    csv_rows[0].update(apply="1", override_title="1.50", override_keywords="2.10;007")
+    write_review_csv(out / "files.csv", FileRecord.columns(), csv_rows)
+    args = ["--files-csv", str(out / "files.csv"), "--folders-csv", str(out / "folders.csv")]
+    assert apply_main(args) == EXIT_OK
+    assert verify_main(["--applied-csv", str(out / "applied.csv")]) == EXIT_OK
+    assert apply_main(args) == EXIT_OK, "a re-run is a resumption, not a conflict"
 
 
 @requires_exiftool
@@ -372,3 +495,172 @@ def test_an_unwritable_format_is_never_approved_by_default(scanned: tuple[Path, 
     bmp = by_name(rows(out / "files.csv"), "old.bmp")
     assert bmp["writable"] == "0"
     assert bmp["apply"] == "0"
+
+
+def _apply(out: Path) -> int:
+    return apply_main(["--files-csv", str(out / "files.csv"), "--folders-csv", str(out / "folders.csv")])
+
+
+def _tags(path: Path, *tags: str) -> dict[str, str]:
+    import json
+    import subprocess
+
+    result = subprocess.run(
+        [EXIFTOOL or "exiftool", "-j", "-G1", "-s", *tags, str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return {k: str(v) for k, v in json.loads(result.stdout)[0].items() if k != "SourceFile"}
+
+
+@requires_exiftool
+def test_a_new_date_replaces_every_old_one_and_its_offset(tmp_path: Path) -> None:
+    """A stale XMP date or +09:00 offset is what Photos may read instead of ours."""
+    photo = _photo(
+        tmp_path / "arc" / "Hawaii 2014" / "IMG_1.jpg",
+        "-EXIF:DateTimeOriginal=2001:01:01 00:05:12",
+        "-EXIF:OffsetTimeOriginal=+09:00",
+        "-EXIF:SubSecTimeOriginal=123",
+        "-XMP-exif:DateTimeOriginal=2001:01:01 00:05:12",
+        "-XMP-xmp:CreateDate=2001:01:01 00:05:12",
+        "-IPTC:DateCreated=2001:01:01",
+        "-IPTC:TimeCreated=00:05:12+09:00",
+    )
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    csv_rows = rows(out / "files.csv")
+    csv_rows[0].update(apply="1", proposed_date="2014-06-20 10:00:00")
+    write_review_csv(out / "files.csv", FileRecord.columns(), csv_rows)
+    assert _apply(out) == EXIT_OK
+
+    tags = _tags(photo, "-time:all", "-IPTC:all", "-XMP:all")
+    dates = {k: v for k, v in tags.items() if "Date" in k and "File" not in k and "Metadata" not in k}
+    assert set(dates.values()) <= {"2014:06:20 10:00:00", "2014:06:20"}, dates
+    assert len(dates) >= 6, dates
+    assert not any(k.endswith(("OffsetTimeOriginal", "SubSecTimeOriginal", "TimeCreated")) for k in tags), (
+        tags
+    )
+
+    assert verify_main(["--applied-csv", str(out / "applied.csv")]) == EXIT_OK
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    row = by_name(rows(out / "files.csv"), "IMG_1.jpg")
+    assert row["date_status"] == "ok" and row["apply"] == "0"
+
+
+@requires_exiftool
+def test_a_gif_with_an_old_xmp_date_settles_after_one_apply(tmp_path: Path) -> None:
+    """Left behind, the old XMP date made every rescan propose the same fix again."""
+    import subprocess
+
+    from make_fixture import GIF
+
+    gif = tmp_path / "arc" / "Party" / "anim.gif"
+    gif.parent.mkdir(parents=True)
+    gif.write_bytes(GIF)
+    subprocess.run(
+        [
+            EXIFTOOL or "exiftool",
+            "-q",
+            "-overwrite_original",
+            "-XMP-exif:DateTimeOriginal=1900:01:01 00:00:00",
+            str(gif),
+        ],
+        check=True,
+    )
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    csv_rows = rows(out / "files.csv")
+    csv_rows[0].update(apply="1", proposed_date="2015-05-05 12:00:00")
+    write_review_csv(out / "files.csv", FileRecord.columns(), csv_rows)
+    assert _apply(out) == EXIT_OK
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    row = by_name(rows(out / "files.csv"), "anim.gif")
+    assert row["existing_date"] == "2015:05:05 12:00:00" and row["date_status"] == "ok"
+
+
+@requires_exiftool
+def test_deleting_the_context_columns_cannot_overwrite_a_real_title(tmp_path: Path) -> None:
+    photo = _photo(tmp_path / "arc" / "Hawaii 2014" / "IMG_1.jpg", "-XMP:Title=Grandma's 80th")
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    csv_rows = rows(out / "files.csv")
+    for row in csv_rows:
+        row.update(apply="1", existing_title="", existing_keywords="")
+    write_review_csv(out / "files.csv", FileRecord.columns(), csv_rows)
+    assert _apply(out) == EXIT_OK
+    assert _tags(photo, "-XMP:Title")["XMP-dc:Title"] == "Grandma's 80th"
+
+
+@requires_exiftool
+def test_a_title_legacy_iptc_cannot_hold_moves_to_xmp_alone(tmp_path: Path) -> None:
+    photo = _photo(
+        tmp_path / "arc" / "Trip" / "IMG_1.jpg", "-charset", "iptc=latin", "-IPTC:ObjectName=Vieux Café"
+    )
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    csv_rows = rows(out / "files.csv")
+    csv_rows[0].update(apply="1", override_title="東京 Noël")
+    write_review_csv(out / "files.csv", FileRecord.columns(), csv_rows)
+    assert _apply(out) == EXIT_OK
+    tags = _tags(photo, "-IPTC:ObjectName", "-XMP:Title")
+    assert tags.get("XMP-dc:Title") == "東京 Noël"
+    assert "IPTC:ObjectName" not in tags, "two different titles would be left behind"
+    assert verify_main(["--applied-csv", str(out / "applied.csv")]) == EXIT_OK
+
+
+@requires_exiftool
+@pytest.mark.skipif(sys.platform != "darwin", reason="Finder tags are a macOS attribute")
+def test_finder_tags_survive_an_apply(tmp_path: Path) -> None:
+    import subprocess
+
+    photo = _photo(tmp_path / "arc" / "Hawaii 2014" / "IMG_1.jpg")
+    name = "com.apple.metadata:_kMDItemUserTags"
+    tag = '<plist version="1.0"><array><string>Red\n6</string></array></plist>'
+    subprocess.run(["xattr", "-w", name, tag, str(photo)], check=True)
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    approve(out, {"IMG_1.jpg"})
+    assert _apply(out) == EXIT_OK
+    assert list(photo.parent.glob("*_original")), "exiftool replaced the file"
+    kept = subprocess.run(["xattr", "-p", name, str(photo)], capture_output=True, text=True).stdout.strip()
+    assert kept == tag
+
+
+@requires_exiftool
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="needs POSIX permissions")
+def test_a_locked_file_is_refused_not_rewritten(tmp_path: Path) -> None:
+    photo = _photo(tmp_path / "arc" / "Hawaii 2014" / "IMG_1.jpg")
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    approve(out, {"IMG_1.jpg"})
+    before = photo.read_bytes()
+    photo.chmod(0o444)
+    try:
+        assert _apply(out) == EXIT_ATTENTION
+    finally:
+        photo.chmod(0o644)
+    assert photo.read_bytes() == before
+    assert [r["classification"] for r in rows(out / "apply_conflicts.csv")] == ["unwritable"]
+
+
+@requires_exiftool
+def test_a_wrong_camera_clock_is_shifted_once_approved(tmp_path: Path) -> None:
+    folder = tmp_path / "arc" / "2016" / "03-27-2016 - Easter"
+    photos = [
+        _photo(folder / f"DSCF{i}.JPG", f"-DateTimeOriginal=2015:05:02 1{i}:00:00", "-Model=X-T1")
+        for i in range(3)
+    ]
+    out = tmp_path / "out"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    row = by_name(rows(out / "files.csv"), "DSCF1.JPG")
+    assert row["proposed_date"] == "2016:03:27 11:00:00"
+    assert row["date_source"] == "clock_shift" and row["date_match"] == "+330 days"
+    assert row["apply"] == "0", "moving a whole event is the reviewer's call"
+
+    approve(out, {p.name for p in photos})
+    assert _apply(out) == EXIT_OK
+    assert _tags(photos[2], "-EXIF:DateTimeOriginal")["ExifIFD:DateTimeOriginal"] == "2016:03:27 12:00:00"
+    scan_main(["--root", str(tmp_path / "arc"), "--out-dir", str(out)])
+    row = by_name(rows(out / "files.csv"), "DSCF1.JPG")
+    assert row["proposed_date"] == "" and row["date_flags"] == ""

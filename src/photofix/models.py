@@ -8,12 +8,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-DateSource = Literal["exif_createdate", "filename", "folder", "filesystem"]
-Confidence = Literal["high", "medium", "low"]
+if TYPE_CHECKING:
+    from .datenames import PartialDate
+
+DateSource = Literal["existing_metadata", "filename", "folder", "exif_createdate", "clock_shift"]
+Confidence = Literal["high", "medium"]
 DateStatus = Literal["ok", "missing", "implausible", "clustered"]
-ConflictClass = Literal["already_applied", "modified_elsewhere"]
+ConflictClass = Literal["already_applied", "modified_elsewhere", "unwritable"]
 VerifyBucket = Literal["verified", "not_applied", "unexpected_change"]
 
 
@@ -37,6 +40,12 @@ class FolderProposal:
     date_match: str
     date_rule: str
     skip: bool
+    #: A month and day with no year in this folder's name ("12.21 Barney"),
+    #: waiting for a parent folder to supply the year. None once resolved.
+    partial: PartialDate | None = None
+    #: Earliest and latest year when the name spans several ("Grandpa
+    #: (1920-1995)"). Such a folder gives no date, and stops the search for one.
+    year_span: tuple[int, int] | None = None
 
     @property
     def has_text(self) -> bool:
@@ -51,9 +60,10 @@ class FolderRecord:
     folder_path: str
     file_count: int
     folder_name: str
-    proposed_title: str
-    proposed_keywords: str
-    proposed_date: str
+    title: str
+    keywords: str
+    #: Information only. Dates are decided per photo in files.csv.
+    date_found: str
     skip: int
 
     @staticmethod
@@ -65,10 +75,11 @@ class FolderRecord:
 class FileRecord:
     """One row of files.csv.
 
-    The spec's fifteen columns come first, except that `apply` is held back to
-    the end: it is the only column edited in bulk, so it stays at the right-hand
-    edge of the sheet where a fill-down never has to skip read-only columns. The
-    eight added columns are read-only review context and sit between.
+    `apply` is held back to the end: it is the only column edited in bulk, so
+    it stays at the right-hand edge of the sheet where a fill-down never has to
+    skip read-only columns. Editable: `proposed_date`, the two `override_`
+    columns, `filename_title` (apply uses it as the title unless it is
+    cleared), and `apply`. The rest is review context.
     """
 
     SourceFile: str
@@ -81,8 +92,8 @@ class FileRecord:
     date_match: str
     confidence: str
     existing_keywords: str
-    proposed_keywords: str
-    proposed_title: str
+    override_keywords: str
+    override_title: str
     scan_size: int
     scan_mtime: str
     # --- added, read-only review context ---
@@ -94,6 +105,11 @@ class FileRecord:
     date_rule: str
     inherit_title: str
     inherit_keywords: str
+    filename_title: str
+    #: What an approved row would write, as of the scan. Edits to folders.csv
+    #: or the override columns change it; apply works it out afresh.
+    title_to_write: str
+    keywords_to_write: str
     # --- the edit target, last by design ---
     apply: int
 

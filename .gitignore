@@ -7,9 +7,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.DS_Store
 
 # Scan/apply/verify artifacts
 out/
+out-*/
 *.jsonl
 scan.db
 scan.db-wal

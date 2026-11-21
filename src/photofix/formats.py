@@ -8,6 +8,7 @@ writing to scratch files and reading back what landed.
 Verified on exiftool 13.59:
 
     .png   EXIF yes   IPTC yes(*)  XMP yes
+    .heic  EXIF yes   IPTC NO      XMP yes   (silently: no warning, nothing stored)
     .webp  EXIF yes   IPTC NO      XMP yes
     .gif   EXIF NO    IPTC NO      XMP yes
     .bmp   not writable at all
@@ -83,8 +84,9 @@ WRITE_CAPABILITY: Final[dict[str, frozenset[TagFamily]]] = {
     ".jpeg": _ALL,
     ".tif": _ALL,
     ".tiff": _ALL,
-    ".heic": _ALL,
-    ".heif": _ALL,
+    # Verified on 13.55: exiftool reports success but stores no IPTC in HEIC.
+    ".heic": _EXIF_XMP,
+    ".heif": _EXIF_XMP,
     # TIFF-based RAW. All six are in `exiftool -listwf`; an earlier draft of the
     # plan called .arw/.raf/.orf "limited", which was wrong about write support.
     # The real caution is maker-note preservation, which _original backups cover.

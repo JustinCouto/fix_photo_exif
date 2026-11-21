@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from photofix.exiftool import DELETE_MARKER
 from photofix.verify import compare, find_strays, load_intent, normalize_value
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,27 @@ def test_title_comparison_is_case_sensitive() -> None:
 
 def test_none_normalizes_to_empty() -> None:
     assert normalize_value("IPTC:ObjectName", None) == ""
+
+
+def test_merged_keywords_verify_against_the_union_applied_csv_holds() -> None:
+    intent = {"a.jpg": {"IPTC:Keywords": "family;Christmas"}}
+    actual = {"a.jpg": {"IPTC:Keywords": ["family", "Christmas"]}}
+    report = compare(intent, actual, {"a.jpg": {"IPTC:Keywords": ["family"]}})
+    assert report.not_applied == [] and len(report.verified) == 1
+
+
+def test_an_override_that_left_old_keywords_behind_fails() -> None:
+    """Keywords that were there before are not excused: a replace must replace."""
+    intent = {"a.jpg": {"IPTC:Keywords": "Christmas"}}
+    actual = {"a.jpg": {"IPTC:Keywords": ["family", "Christmas"]}}
+    report = compare(intent, actual, {"a.jpg": {"IPTC:Keywords": ["family"]}})
+    assert len(report.not_applied) == 1
+
+
+def test_a_deleted_tag_verifies_as_absent() -> None:
+    intent = {"a.jpg": {"EXIF:OffsetTimeOriginal": DELETE_MARKER}}
+    assert len(compare(intent, {"a.jpg": {}}).verified) == 1
+    assert len(compare(intent, {"a.jpg": {"EXIF:OffsetTimeOriginal": "+09:00"}}).not_applied) == 1
 
 
 # ---------------------------------------------------------------------------

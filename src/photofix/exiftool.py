@@ -4,19 +4,24 @@ Two invocation shapes, both driven by an argfile so no archive-sized command
 line is ever constructed and no shell quoting rules apply:
 
     read   exiftool -json -G0 <tags> -@ batch.args
-    write  exiftool -csv=applied.csv -sep ";" -@ targets.args
+    write  exiftool -csv=applied.csv -f -api MissingTagValue=<marker> -sep ";" -@ targets.args
 
 Deliberately absent flags, each for a specific reason:
 
 * No ``-m``. Suppressing minor warnings would hide exactly the "this file is
   subtly broken" signal the audit exists to surface.
-* No ``-f``. With ``-csv=``, ``-f`` turns empty cells into deletions, which
-  would silently destroy metadata on every unapproved column.
 * No ``-overwrite_original``. The ``_original`` backups are the undo story.
+
+``-f`` is present, but only together with ``MissingTagValue`` set to
+DELETE_MARKER: then a cell holding exactly the marker deletes its tag and an
+empty cell is still ignored. Either one alone is dangerous: ``-f`` with the
+default makes a cell of "-" a deletion (a title of "-"), and an empty
+MissingTagValue makes every blank cell one.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -40,10 +45,18 @@ READ_TAGS: Final[tuple[str, ...]] = (
     "DateTimeOriginal",
     "CreateDate",
     "ModifyDate",
+    "OffsetTimeOriginal",
+    "OffsetTimeDigitized",
+    "SubSecTimeOriginal",
+    "SubSecTimeDigitized",
     "Keywords",
     "ObjectName",
     "Subject",
     "Title",
+    "TagsList",
+    "HierarchicalSubject",
+    "XPTitle",
+    "XPKeywords",
     "DateCreated",
     "Make",
     "Model",
@@ -51,7 +64,23 @@ READ_TAGS: Final[tuple[str, ...]] = (
     "FileModifyDate",
     "Warning",
     "Error",
+    # Every IPTC tag, so apply can tell a file with no IPTC from one whose
+    # existing IPTC is in a legacy character set (see apply.iptc_charset).
+    "IPTC:All",
 )
+
+#: An applied.csv cell holding exactly this deletes the tag (see the module
+#: docstring). Chosen so no real title or keyword can collide with it.
+DELETE_MARKER: Final = "#photofix-delete#"
+
+#: Added to every record read with READ_TAGS above, so a scan.db read before
+#: IPTC:All was requested is recognizable as not knowing a file's IPTC state.
+IPTC_READ_MARKER: Final = "Photofix:IPTCRead"
+
+#: Added to every record as well: which READ_TAGS it was read with. A record
+#: read before a tag was added cannot say whether the file has that tag.
+READ_VERSION_TAG: Final = "Photofix:ReadVersion"
+READ_VERSION: Final = hashlib.sha256("\n".join(READ_TAGS).encode()).hexdigest()[:12]
 
 #: List-valued tags. exiftool's JSON gives a bare string for a single value and
 #: a list for several, so every consumer would otherwise need this check.
@@ -111,8 +140,26 @@ def normalize_key(path: str | Path) -> str:
     Both are normalized away so a returned record can always be matched to the
     path that was requested.
     """
-    text = os.path.normpath(str(path)).replace("\\", "/")
+    text = os.path.normpath(str(path))
+    if os.sep == "\\":
+        # Only on Windows: elsewhere a backslash is a legal filename character.
+        text = text.replace("\\", "/")
     return unicodedata.normalize("NFC", text)
+
+
+_CSTR_ESCAPES: Final = str.maketrans({"\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"})
+
+
+def argfile_line(path: str) -> str:
+    """A path as one argfile line.
+
+    A newline in a filename would otherwise split it into two arguments, and the
+    second could be read as an option ("x\\n-Title=y.jpg" writes a title).
+    exiftool's `#[CSTR]` prefix marks a line as C-escaped.
+    """
+    if any(c in path for c in "\n\r"):
+        return "#[CSTR]" + path.translate(_CSTR_ESCAPES)
+    return path
 
 
 def normalize_tags(record: TagDict) -> TagDict:
@@ -187,7 +234,7 @@ class ExifTool:
         argfile = directory / name
         with argfile.open("w", encoding="utf-8", newline="\n") as fh:
             for path in paths:
-                fh.write(f"{path}\n")
+                fh.write(f"{argfile_line(str(path))}\n")
         return argfile
 
     # -- reading ----------------------------------------------------------
@@ -211,7 +258,9 @@ class ExifTool:
         if not text:
             return [], proc
         try:
-            parsed = json.loads(text)
+            # Numbers stay text: a title "1.50" or keyword "007" would otherwise
+            # come back as 1.5 and 7, and never match what was written.
+            parsed = json.loads(text, parse_float=str, parse_int=str)
         except json.JSONDecodeError:
             return [], proc
         return [dict(item) for item in parsed], proc
@@ -259,7 +308,7 @@ class ExifTool:
                 continue
             key = normalize_key(source)
             got.add(key)
-            records[key] = normalize_tags(record)
+            self._keep(source, record, records, failures)
 
         missing = [p for p in paths if normalize_key(p) not in got]
         if not missing:
@@ -295,8 +344,7 @@ class ExifTool:
             except ExifToolError as exc:
                 stderr = str(exc)
             if parsed:
-                record = parsed[0]
-                records[normalize_key(record.get("SourceFile", paths[0]))] = normalize_tags(record)
+                self._keep(str(parsed[0].get("SourceFile", paths[0])), parsed[0], records, failures)
             else:
                 self.log.warning("unreadable file", extra={"path": str(paths[0]), "stderr": stderr})
                 failures.append(BatchFailure(str(paths[0]), "unreadable", stderr))
@@ -306,6 +354,25 @@ class ExifTool:
         self._read_chunk(paths[:mid], records, failures)
         self._read_chunk(paths[mid:], records, failures)
 
+    def _keep(
+        self, source: str, record: TagDict, records: dict[str, TagDict], failures: list[BatchFailure]
+    ) -> None:
+        """Store a record, or fail it when exiftool could not actually read the file.
+
+        A file it cannot open ("Error opening file") still comes back as a record
+        holding only SourceFile and the error. Stored as-is it would look like a
+        photo with no date and no keywords, and its real metadata would be
+        proposed for replacement.
+        """
+        error = record.get("ExifTool:Error")
+        if error:
+            self.log.warning("unreadable file", extra={"path": source, "error": str(error)})
+            failures.append(BatchFailure(source, "unreadable", str(error)))
+            return
+        record[IPTC_READ_MARKER] = True
+        record[READ_VERSION_TAG] = READ_VERSION
+        records[normalize_key(source)] = normalize_tags(record)
+
     # -- writing ----------------------------------------------------------
 
     def apply_csv(
@@ -313,7 +380,6 @@ class ExifTool:
         csv_path: Path,
         targets: Sequence[Path | str],
         *,
-        merge_keywords: bool = False,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Apply one CSV to a set of files in a single invocation.
@@ -331,21 +397,28 @@ class ExifTool:
             )
         argfile = self._write_argfile(targets, "photofix_targets.args")
         args = [
-            # -csv+= merges into existing list tags; -csv= replaces them.
-            f"{'-csv+=' if merge_keywords else '-csv='}{csv_path}",
+            # Always replace: --merge-keywords writes the deduplicated union,
+            # computed by apply, rather than letting -csv+= append duplicates.
+            f"-csv={csv_path}",
+            "-f",
+            "-api",
+            f"MissingTagValue={DELETE_MARKER}",
             "-sep",
             ";",
             "-charset",
             "filename=utf8",
-            # Not a flag: this is the CodedCharacterSet *tag*, set so IPTC
-            # readers know the values are UTF-8 rather than guessing Latin-1.
-            "-codedcharacterset=utf8",
+            # No global -codedcharacterset=utf8: it relabels a file's existing
+            # Latin-1 IPTC as UTF-8 without converting it ("Café" -> "Caf?").
+            # applied.csv sets IPTC:CodedCharacterSet per row where that is safe.
             "-P",  # preserve filesystem mtime
             "-@",
             str(argfile),
         ]
-        assert "-f" not in args and "-overwrite_original" not in args
-        return self._run(args, timeout=timeout or max(self.timeout, 1800.0))
+        assert "-overwrite_original" not in args
+        assert args[args.index("-f") + 2] == f"MissingTagValue={DELETE_MARKER}"
+        # One invocation writes the whole archive, and a large file rewrite can
+        # take a second, so the ceiling grows with the file count.
+        return self._run(args, timeout=timeout or max(self.timeout, 1800.0, 2.0 * len(targets)))
 
 
 def parse_update_counts(stderr: str) -> dict[str, int]:
@@ -357,10 +430,11 @@ def parse_update_counts(stderr: str) -> dict[str, int]:
         if not parts or not parts[0].isdigit():
             continue
         number = int(parts[0])
-        if "updated" in line:
+        # "N files weren't updated due to errors" also contains "updated".
+        if "error" in line.lower():
+            counts["errors"] = number
+        elif "updated" in line:
             counts["updated"] = number
         elif "unchanged" in line:
             counts["unchanged"] = number
-        elif "error" in line.lower():
-            counts["errors"] = number
     return counts
